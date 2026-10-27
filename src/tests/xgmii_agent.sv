@@ -82,7 +82,7 @@ class xgmii_driver;
     endtask
 endclass
 
-//xgmii receptor
+//xgmii receptor y verificador de protocolo IEEE 802.3 (10G)
 class xgmii_monitor;
     virtual xgmii_if vif;
 
@@ -91,32 +91,79 @@ class xgmii_monitor;
     endfunction
 
     task receive_packet(output eth_packet pkt);
-        reg [7:0] q_bytes [$]; //arreglo dinámico para almacenar los bytes capturados
-        bit capturing = 0; //bandera para indicar si estamos capturando bytes del paquete
+        reg [7:0]   q_bytes [$];
+        bit         capturing = 0;
+        xgmii_err_t err = ERR_NONE;
 
         forever begin
             @(posedge vif.rx_clk);
-            if (vif.rx_valid) begin
-                if (vif.rxc[0] == 1'b1 && vif.rxd[7:0] == 8'hFB) begin //si encontramos el Start of Frame (0xFB) en lane 0
+            if (!vif.rx_valid) continue;
+
+            // 1 FUERA DE TRAMA : Esperando Idle o Start (0xFB en lane 0 o 4) 
+            if (!capturing) begin
+                if (vif.rxc == 8'hFF && vif.rxd == 64'h07070707_07070707) begin
+                    continue; // Idles validos (802.3)
+                end
+                else if (vif.rxc == 8'h01 && vif.rxd == 64'hD5555555_555555FB) begin //chequeamos si el start esta en lane 0 
+                    // Start legal en lane 0 + Preambulo (6x 0x55) + SFD (0xD5)
                     capturing = 1;
                     q_bytes.delete();
                 end
-                else if (capturing && vif.rxc == 8'h00) begin //si estamos capturando y no hay control, agregamos los bytes al arreglo
-                    for (int b = 0; b < 8; b++) begin
-                        q_bytes.push_back(vif.rxd[b*8 +: 8]);
-                    end
+                else if (vif.rxc == 8'h1F && vif.rxd == 64'h555555FB_07070707) begin //chequeamos si el start esta en lane 4
+                    // Start legal en lane 4 (lanes 0..3 Idles, lane 4 0xFB, lanes 5..7 Preambulo)
+                    capturing = 1;
+                    q_bytes.delete();
                 end
-                else if (capturing && vif.rxc != 8'h00) begin //si estamos capturando y encontramos un control, verificamos si es Terminate (0xFD) o Error (0xFE)
-                    // Termino la trama (por un 0xFD normal o por un caracter de error 0xFE)
+                else begin
+                    //si llegamos a este punto es porque el Start (0xFB) no esta en lane 0 o 4 (esta mal codificado))
+                    err = (vif.rxc == 8'h00) ? ERR_NO_START : ERR_BAD_START_LANE;
+                    $display("[%0t ns] [XGMII MON ERROR] Inicio/Idle invalido 802.3: rxd=0x%016h rxc=0x%02h (%s)",
+                             $time, vif.rxd, vif.rxc, err.name());
+                    capturing = 1;
+                    q_bytes.delete();
+                end
+            end
+
+            // 2. DENTRO DE TRAMA: Capturando datos o verificando Terminate (0xFD) ---
+            else begin
+                if (vif.rxc == 8'h00) begin
+                    // Capturando datos
+                    for (int b = 0; b < 8; b++)
+                        q_bytes.push_back(vif.rxd[b*8 +: 8]); 
+                end
+                else begin
+                    // Buscamos en que lane esta el Terminate (0xFD)
+                    int t = -1;
+                    for (int b = 0; b < 8; b++) begin 
+                        if (vif.rxc[b] && vif.rxd[b*8 +: 8] == 8'hFD) begin
+                            t = b; // Encontramos el lane con Terminate y se lo guardamos en t
+                        end
+                    end
+                    if (t == -1) begin //si no encontramos ningun lane con 0xFD es porque la trama termino sin mandar Terminate (0xFD) (paso directo a Idles o llego 0xFE)
+                        err = ERR_NO_TERMINATE;
+                        $display("[%0t ns] [XGMII MON ERROR] Fin de trama sin Terminate (0xFD): rxd=0x%016h rxc=0x%02h",
+                                 $time, vif.rxd, vif.rxc);
+                    end
+                    else begin
+                        // Segun 802.3  lanes < t son datos (rxc=0), lane t es 0xFD, lanes > t son Idles 0x07 (rxc=1)
+                        for (int b = 0; b < t; b++)
+                            q_bytes.push_back(vif.rxd[b*8 +: 8]);
+
+                        if (vif.rxc != (8'hFF << t) || (vif.rxd >> ((t+1)*8)) != (64'h07070707_07070707 >> ((t+1)*8))) begin //si no sigue esa regla es porque el Terminate (0xFD) esta mal codificado
+                            err = ERR_MID_TERMINATE;
+                            $display("[%0t ns] [XGMII MON ERROR] Terminate (0xFD) mal codificado en lane %0d: rxd=0x%016h rxc=0x%02h",
+                                     $time, t, vif.rxd, vif.rxc);
+                        end
+                    end
+
                     capturing = 0;
                     break;
                 end
             end
         end
 
-        pkt = new(q_bytes.size()); //creamos un nuevo eth_packet con el tamaño del arreglo dinámico
-        foreach (q_bytes[i]) pkt.payload[i] = q_bytes[i]; //para cada byte capturado, lo copiamos al payload del paquete
-        //nos queda finalmente el paquete reconstruido en pkt en formato eth_packet 
+        pkt = new(q_bytes.size(), err);
+        foreach (q_bytes[i]) pkt.payload[i] = q_bytes[i];
     endtask
 endclass
 

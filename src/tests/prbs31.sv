@@ -5,7 +5,7 @@
 
 // --- GENERADOR PRBS31 ---
 
-#define SEED 31'h7FFFFFFF
+localparam bit [30:0] SEED = 31'h7FFFFFFF;
 
 class prbs31_generator;
     reg [30:0] state;

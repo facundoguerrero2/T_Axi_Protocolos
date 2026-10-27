@@ -202,12 +202,15 @@ module tb_top;
 
             prbs_gen.create_packet(64, tx_pkt, ERR_BAD_START_LANE);
 
-            // Lanzamos el envio y en paralelo vigilamos los flags de error del DUT
+            // Lanzamos el envio y en paralelo el monitor XGMII + vigilancia del DUT
             fork
                 begin
                     $display("[%0t ns] [TB] Enviando trama con Start (0xFB) en lane 2...", $time);
                     agent.driver.send_packet(tx_pkt);
-                    repeat(25) @(posedge clk); // Damos tiempo a que cruce la tuberia del DUT
+                    repeat(25) @(posedge clk); // Damos tiempo a que cruce la tuberia
+                end
+                begin
+                    agent.monitor.receive_packet(rx_pkt);
                 end
                 begin
                     // Vigilamos durante 40 ciclos si el DUT levanta las banderas de error
@@ -219,18 +222,23 @@ module tb_top;
                 end
             join
 
-            `ifdef loopback_btw_agents
-                $display("[RESULTADO TEST 3] En modo loopback_btw_agents no hay DUT que verifique protocolo.");
-            `else
+            $display("[RESULTADO TEST 3 - MONITOR XGMII]:");
+            $display("  -> Error detectado por monitor : %s", rx_pkt.err_type.name());
+            if (rx_pkt.err_type != ERR_NONE)
+                $display("  => [TEST 3 MONITOR OK] El monitor XGMII detecto el error de protocolo 802.3!");
+            else
+                $display("  => [TEST 3 MONITOR ERROR] El monitor XGMII NO detecto el error.");
+
+            `ifndef loopback_btw_agents
                 $display("[RESULTADO TEST 3 - ESTATUS DEL DUT]:");
                 $display("  -> tx_bad_block detectado : %b (Esperado: 1)", vio_tx_bad_block);
                 $display("  -> rx_bad_block detectado : %b", vio_rx_bad_block);
                 $display("  -> rx_error_count         : Antes=%0d | Ahora=%0d", err_cnt_antes, vif.rx_error_count);
                 
                 if (vio_tx_bad_block || vio_rx_bad_block || (vif.rx_error_count > err_cnt_antes))
-                    $display("  => [TEST 3 OK] El DUT detecto correctamente el error de protocolo XGMII!");
+                    $display("  => [TEST 3 DUT OK] El DUT detecto correctamente el error de protocolo XGMII!");
                 else
-                    $display("  => [TEST 3 ERROR] El DUT NO reporto el bloque invalido.");
+                    $display("  => [TEST 3 DUT ERROR] El DUT NO reporto el bloque invalido.");
             `endif
         end
 
