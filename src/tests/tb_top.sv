@@ -26,6 +26,10 @@ module tb_top;
         .rx_clk(clk), .rx_rst(rst)
     );
 
+    // Señales para inyectar Sync Headers invalidos en SERDES RX (Tests 4 y 5)
+    reg        force_rx_hdr_en  = 1'b0;
+    reg  [1:0] force_rx_hdr_val = 2'b00;
+
     // =====================================================================
     // CONEXION DEL HARDWARE (Segun si esta definido loopback_btw_agents o no)
     // =====================================================================
@@ -50,6 +54,9 @@ module tb_top;
     wire [1:0]  serdes_hdr_loop;
     wire        serdes_hdr_valid_loop;
     wire        serdes_gbx_sync_loop;
+
+    // Mux para interceptar serdes_rx_hdr e inyectar headers 00 o 11
+    wire [1:0]  serdes_rx_hdr_in = force_rx_hdr_en ? force_rx_hdr_val : serdes_hdr_loop;
 
     taxi_eth_phy_10g #(
         .DATA_W(64),
@@ -85,7 +92,7 @@ module tb_top;
 
         .serdes_rx_data         (serdes_data_loop),
         .serdes_rx_data_valid   (serdes_data_valid_loop),
-        .serdes_rx_hdr          (serdes_hdr_loop),
+        .serdes_rx_hdr          (serdes_rx_hdr_in),
         .serdes_rx_hdr_valid    (serdes_hdr_valid_loop),
         .serdes_rx_gbx_sync     (serdes_gbx_sync_loop),
         .serdes_rx_bitslip      (),
@@ -241,6 +248,93 @@ module tb_top;
                     $display("  => [TEST 3 DUT ERROR] El DUT NO reporto el bloque invalido.");
             `endif
         end
+
+
+        `ifndef loopback_btw_agents
+        // =====================================================================
+        // TEST 4: PERDIDA DE BLOCK LOCK (>16 Sync Headers invalidos en 64 bloques)
+        // =====================================================================
+        $display("\n----------------------------------------------------------");
+        $display(" TEST 4: MAQUINA DE ESTADOS BLOCK SYNC (>16 headers invalidos)");
+        $display("----------------------------------------------------------");
+        begin
+            bit cayo_block_lock = 0;
+            bit vio_datos_validos = 0;
+
+            $display("[%0t ns] [TB] Inyectando 40 Sync Headers invalidos (2'b00)...", $time);
+            @(posedge clk);
+            force_rx_hdr_en  <= 1'b1;
+            force_rx_hdr_val <= 2'b00;
+
+            repeat(40) begin
+                @(posedge clk);
+                if (!vif.rx_block_lock) cayo_block_lock = 1;
+                if (vif.rxc == 8'h00)   vio_datos_validos = 1; // No deben salir datos por XGMII
+            end
+
+            force_rx_hdr_en <= 1'b0;
+            $display("  -> rx_block_lock cayo a 0 : %b (Esperado: 1)", cayo_block_lock);
+            $display("  -> Datos XGMII recibidos  : %b (Esperado: 0)", vio_datos_validos);
+
+            if (cayo_block_lock && !vio_datos_validos)
+                $display("  => [TEST 4 OK] El DUT perdio sincronismo (rx_block_lock=0) y bloqueo datos!");
+            else
+                $display("  => [TEST 4 ERROR] Fallo en maquina de estados de sincronizacion.");
+
+            // Recuperamos el Block Lock (64 headers validos) antes de pasar al Test 5
+            wait(vif.rx_block_lock === 1'b1);
+            repeat(5) @(posedge clk);
+            $display("[%0t ns] [TB] Enlace re-sincronizado (rx_block_lock = 1).", $time);
+        end
+
+
+        // =====================================================================
+        // TEST 5: DECODIFICACION DE SYNC HEADERS INVALIDOS (2'b00 y 2'b11)
+        // =====================================================================
+        $display("\n----------------------------------------------------------");
+        $display(" TEST 5: DECODIFICACION SYNC HEADERS INVALIDOS (00 y 11)");
+        $display("----------------------------------------------------------");
+        begin
+            bit ok_hdr_00 = 0;
+            bit ok_hdr_11 = 0;
+
+            // 1) Inyectar header 2'b00 por 1 ciclo
+            $display("[%0t ns] [TB] Inyectando Sync Header 2'b00...", $time);
+            @(posedge clk);
+            force_rx_hdr_en  <= 1'b1;
+            force_rx_hdr_val <= 2'b00;
+            @(posedge clk);
+            force_rx_hdr_en  <= 1'b0;
+
+            repeat(5) begin
+                @(posedge clk);
+                if (vif.rx_bad_block && vif.rxd == 64'hFEFEFEFE_FEFEFEFE && vif.rxc == 8'hFF)
+                    ok_hdr_00 = 1;
+            end
+
+            // 2) Inyectar header 2'b11 por 1 ciclo
+            $display("[%0t ns] [TB] Inyectando Sync Header 2'b11...", $time);
+            @(posedge clk);
+            force_rx_hdr_en  <= 1'b1;
+            force_rx_hdr_val <= 2'b11;
+            @(posedge clk);
+            force_rx_hdr_en  <= 1'b0;
+
+            repeat(5) begin
+                @(posedge clk);
+                if (vif.rx_bad_block && vif.rxd == 64'hFEFEFEFE_FEFEFEFE && vif.rxc == 8'hFF)
+                    ok_hdr_11 = 1;
+            end
+
+            $display("  -> Header 2'b00 (rx_bad_block=1 y rxd=8x0xFE) : %b", ok_hdr_00);
+            $display("  -> Header 2'b11 (rx_bad_block=1 y rxd=8x0xFE) : %b", ok_hdr_11);
+
+            if (ok_hdr_00 && ok_hdr_11)
+                $display("  => [TEST 5 OK] El decodificador RX rechazo 00 y 11 emitiendo 0xFE y rx_bad_block=1!");
+            else
+                $display("  => [TEST 5 ERROR] Fallo en deteccion de Sync Headers invalidos.");
+        end
+        `endif
 
         repeat(20) @(posedge clk);
         $display("\n==========================================================");
