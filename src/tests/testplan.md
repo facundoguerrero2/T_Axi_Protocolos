@@ -1,108 +1,77 @@
-# Test Plan – `taxi_eth_phy_10g` (PCS 10GBASE-R, IEEE 802.3 Cl.49)
+# Test Plan: PHY 10G (`taxi_eth_phy_10g`)
 
-DUT: `taxi/src/eth/rtl/taxi_eth_phy_10g.sv`
-Foco inicial: **camino TX** (XGMII → 64b/66b → scrambler → gearbox → SERDES). RX se agrega después.
+## Entorno de Pruebas (Setup)
+* Instanciar el DUT `taxi_eth_phy_10g`.
+* Conectar la interfaz `xgmii_if` a los pines XGMII del DUT (`xgmii_txd`, `xgmii_rxd`, etc.).
+* Hacer un **loopback a nivel SERDES**: conectar de forma directa las salidas `serdes_tx_data` y `serdes_tx_hdr` a las entradas `serdes_rx_data` y `serdes_rx_hdr` del propio módulo.
+* Utilizar las clases `xgmii_agent` y `prbs_agent` conectadas a la interfaz para estimular y verificar.
 
-## 1. Arquitectura del testbench
+## Casos de Prueba
 
-```
- top_LSFR (HW) -> prbs_agent -> xgmii_agent.drive_tx -> [ DUT ] -> serdes_tx_*
-                                                                      |
-                                                  serdes_monitor (decodifica 66b + descrambler)
-                                                                      |
- prbs_agent.check_rx  <-  xgmii_agent.monitor_rx  <- (XGMII reconstruido)
-```
+1. **Sanity Check (Loopback corto sin errores)**
+   * Usar la tarea `run_generation` con 32 bytes.
+   * Comprobamos que el camino de datos básico funciona de punta a punta. Lo que entra por el XGMII TX sale por el SERDES, vuelve a entrar, y se lee limpio en el XGMII RX.
 
-| Componente | Archivo | Estado |
-|---|---|---|
-| Interfaces + `eth_packet` | `interfaces.sv` | Hecho |
-| PRBS agent (genera/chequea payload) | `prbs_agent.sv` | Hecho (loopback validado) |
-| XGMII agent (driver + monitor) | `xgmii_agent.sv` | Hecho (loopback validado) |
-| SERDES monitor / modelo de referencia | `serdes_agent.sv` | **Pendiente** |
-| Interfaz SERDES | `interfaces.sv` | **Pendiente** |
-| Top con DUT | `tb_dut.sv` | **Pendiente** |
+2. **Extremos de longitud de trama (Frame Size)**
+   * Enviar frames con `run_generation(64)` y `run_generation(1518)`.
+   * Para ver que la PHY maneja bien los tamaños mínimos y máximos estándar de Ethernet antes de fragmentarse.
 
-## 2. Fase 0 – Validación de agentes (loopback)  ✅
-- [x] 32 bytes PRBS → XGMII → XGMII → check = PASSED.
-- [ ] Inyección de error (`^ 8'h01` en el driver) → el checker debe dar FAILED (prueba que el checker no miente).
-- [ ] Tamaños variados: 1, 7, 8, 9, 15, 16, 64, 1500 bytes (probar borde múltiplo de 8 y Terminate).
-- [ ] Idles entre tramas y tramas back-to-back.
+3. **Alineación de Terminate (Bytes impares)**
+   * Enviar un payload que no sea múltiplo de 8 (ej. 123 bytes o 35 bytes).
+   * Obligamos al `xgmii_agent` a colocar el byte de `Terminate` (0xFD) en un lane intermedio. Sirve para confirmar que el módulo PCS procesa bien los finales de trama desalineados.
 
-## 3. Fase 1 – Reset y estado inicial (DUT)
-| ID | Test | Esperado |
-|---|---|---|
-| R1 | Reset en `tx_rst`/`rx_rst` | Salidas en estado conocido, sin X |
-| R2 | Solo Idles por XGMII | `serdes_tx_hdr` = `2'b01` (control), bloque de Idle válido |
-| R3 | `tx_bad_block` tras reset | 0 |
+4. **Inyección de errores en Payload**
+   * Activar `inject_error = 1` en el `xgmii_agent` y elegir un `error_byte_idx`.
+   * Alteramos un byte del payload. La PHY debería dejar pasar este dato (es transparente al contenido). El test pasa si el `check_rx` del `prbs_agent` falla indicando exactamente ese error detectado.
 
-## 4. Fase 2 – ENCODE (64b/66b)
-Se chequea en la salida SERDES (con scrambler deshabilitado: `SCRAMBLER_DISABLE=1`) para aislar el encoder.
+5. **Tráfico en ráfaga**
+   * Llamar a `run_generation` repetidas veces dentro de un loop o un `fork/join`, dejando el mínimo espacio de Idles.
+   * Con esto estresamos la máquina de estados del bloque PCS. Para ver si el módulo se ahoga o si mantiene la sincronización cuando la red está al 100% de capacidad.
 
-| ID | Test | Esperado |
-|---|---|---|
-| E1 | **Sync header** con datos puros (`txc=0x00`) | `hdr = 2'b10` |
-| E2 | **Sync header** con cualquier control (`txc≠0`) | `hdr = 2'b01` |
-| E3 | Header nunca `00` ni `11` | Siempre 01 o 10 |
-| E4 | Payload en bloque de datos | `serdes_tx_data` = bytes de `txd` sin cambios (lane0 = LSB) |
-| E5 | **Block type** Start en Lane 0 (`0xFB`) | BT = `0x78` |
-| E6 | Block type Terminate en cada lane (T0..T7) | BT = `0x87,0x99,0xAA,0xB4,0xCC,0xD2,0xE1,0xFF` |
-| E7 | Block type Idle (`0x07` x8) | BT = `0x1E` |
-| E8 | Start en Lane 4 (`0xFB` en lane 4) | BT = `0x33` |
-| E9 | Control inválido (ej. `0xFB` en lane 3) | `tx_bad_block`=1, bloque de error |
-| E10 | Trama completa Start→Data→Terminate | Secuencia de bloques correcta |
+6. **Test de PRBS31 Interno del módulo**
+   * Poner a 1 las señales `cfg_tx_prbs31_enable` y `cfg_rx_prbs31_enable` del DUT. No mandar paquetes por el `xgmii_agent`.
+   * Prueba el generador de secuencias pseudoaleatorias integrado en la propia PHY. Se monitorea que los pines de estado (`rx_status`, `rx_block_lock`) den OK sin contabilizar errores.
 
-## 5. Fase 3 – SCRAMBLER (x^58 + x^39 + 1)
-Los 2 bits de header **no** se scramblean, solo los 64 de payload.
+7. **Reset asincrónico bajo tráfico**
+   * Comenzar el envío de un paquete grande (ej. 1500 bytes) y a la mitad afirmar `tx_rst` y `rx_rst` por unos ciclos.
+   * Verifica que el sistema aborte la transmisión correctamente, regrese a su estado inicial de Idles (`0x0707...`) y vuelva a linkear sin quedarse colgado.
 
-| ID | Test | Esperado |
-|---|---|---|
-| S1 | Header sin scramblear | `hdr` igual con o sin scrambler |
-| S2 | Payload scrambleado ≠ payload original | Salida distinta al dato plano |
-| S3 | **Modelo de referencia en SV**: scramblear en el TB y comparar bit a bit | 100% coincidencia |
-| S4 | **Descrambler en el TB** sobre `serdes_tx_data` | Recupera el payload original |
-| S5 | Estado inicial / seed | Coincide con el modelo tras reset |
-| S6 | Cadena larga (≥ 10k bloques) PRBS | Sin desincronización del modelo |
-| S7 | `SCRAMBLER_DISABLE=1` | Datos salen sin modificar |
-| S8 | Patrón todo ceros / todo unos | Salida no queda constante (scrambler funciona) |
+8. **Máquina de estados de sincronización de bloques**
+   * Inyectar headers inválidos en el SERDES (`00` o `11` en `serdes_rx_hdr`) durante más de 16 bloques consecutivos en una ventana de 64 bloques.
+   * Según la norma 802.3, esto debe tirar abajo el estado de sincronización. Comprobamos que la bandera `rx_block_lock` pase a 0 y que no se reciban datos válidos en el XGMII.
 
-## 6. Fase 4 – GEARBOX (66 → 64 bits)
-Con `TX_GBX_IF_EN=1`. El gearbox convierte bloques de 66 bits en palabras de 64 bits; cada 32 palabras de 64 entran 31 bloques de 66 y hay que **pausar 1 ciclo** (`tx_gbx_req_stall`).
+9. **Detección de Errores de Secuencia XGMII**
+   * Forzar al `xgmii_agent` a enviar violaciones de protocolo (ej. un `Start` 0xFB inmediatamente después de otro `Start` sin un `Terminate` en el medio, o datos durante un periodo de Idles).
+   * El módulo PCS deberia detectar la violación, levantar el flag `rx_sequence_error` y propagar bytes de error (`0xFE`) hacia el bus RX.
 
-| ID | Test | Esperado |
-|---|---|---|
-| G1 | Frecuencia de stall | 1 stall cada 33 ciclos (patrón del gearbox) |
-| G2 | `tx_gbx_req_sync` | Pulso de sincronía periódico |
-| G3 | Reconstrucción en el TB | Rearmar bloques de 66b desde palabras de 64b == bloques esperados |
-| G4 | `serdes_tx_hdr_valid` / `serdes_tx_data_valid` | Coherentes con el patrón |
-| G5 | Gearbox deshabilitado (`TX_GBX_IF_EN=0`) | Un bloque de 66b por ciclo, `hdr` separado |
-| G6 | Backpressure (`serdes_tx_gbx_req_stall`) | El DUT respeta el stall, no pierde datos |
+10. **Verificación del Scrambler (Balance DC)**
+    * Con el parámetro `SCRAMBLER_DISABLE = 0`, enviar desde el XGMII una carga útil de puros ceros (`0x00...00`).
+    * El estándar usa un polinomio (x^58 + x^39 + 1) para evitar patrones fijos. Chequeamos que la salida `serdes_tx_data` sea pseudoaleatoria, evitando problemas de balance DC en la fibra/cobre.
 
-## 7. Fase 5 – End to end TX
-- [ ] PRBS → XGMII → DUT → serdes_monitor (descramble + decode) → XGMII reconstruido → `check_rx` = PASSED.
-- [ ] Tramas de tamaños variados y back-to-back.
-- [ ] Tramas con Idles intermedios de longitud aleatoria.
-- [ ] `xgmii_tx_valid` en 0 durante la trama (si aplica).
-- [ ] Soak: ≥ 100k tramas aleatorias.
+11. **Corrupción del Block Type Field (Códigos de Control Inválidos)**
+    * Interceptar en el loopback un bloque de control válido de 66b (ej. Idles `0x1E`) y modificar los primeros 8 bits del payload para que sea un Block Type inexistente en la tabla de la norma.
+    * El decoder debe marcarlo como bloque erróneo (`rx_bad_block` = 1) y reemplazar la salida en el bus `xgmii_rxd` por caracteres de error (`0xFE`).
 
-## 8. Fase 6 – Casos negativos / robustez
-- [ ] Terminate sin Start previo.
-- [ ] Start dentro de otra trama.
-- [ ] Códigos de control reservados.
-- [ ] Reset en mitad de una trama.
-- [ ] `cfg_tx_prbs31_enable=1`: salida es PRBS31 (comparar con modelo).
+12. **Codificación de Ordered Sets (Local / Remote Faults)**
+    * Modificar temporalmente el testbench para enviar por el XGMII un Sequence Ordered Set (Lane 0 = `0x9C`, Lanes 1-3 = `0x00 0x00 0x01` para Local Fault).
+    * Garantiza que el PCS mapee correctamente los códigos de falla de capa física a un bloque de control tipo `0x4B` en el TX, y que el RX lo decodifique a la perfección.
 
-## 9. Fase 7 – RX (siguiente etapa)
-Loopback SERDES TX→RX del DUT: `rx_block_lock`, `rx_status`, `rx_high_ber`, `rx_bad_block`, `rx_error_count`, bitslip, inyección de errores en header y payload.
+13. **Generación de Sync Headers (Datos vs. Control)**
+    * Enviar tráfico de payload continuo por XGMII y, tras finalizar la trama, dejar el bus en reposo transmitiendo Idles (`0x07`).
+    * Chequear en la salida del módulo (`serdes_tx_hdr`) que para los bytes de datos el header codificado sea estrictamente `01` y para los Idles (bloques de control) sea estrictamente `10`. Esto verifica la regla fundamental de multiplexación del encoding 64b/66b.
 
-## 10. Criterios de salida
-- Todos los tests de las fases 0–5 en PASSED, sin errores X/Z.
-- Cobertura funcional: todos los block types de Cl.49 generados y vistos al menos una vez.
-- Tamaños de trama {1..1518} y alineaciones de Start (lane 0 y lane 4) cubiertos.
-- Regresión con semillas PRBS distintas.
+14. **Decodificación de Sync Headers inválidos**
+    * Interceptar la conexión del loopback e inyectar forzadamente un header `00` y, en un ciclo posterior, un `11` en la entrada `serdes_rx_hdr`.
+    * La norma prohíbe explícitamente estos headers para mantener el balanceo y sincronización. El decodificador RX debe detectar la violación, levantar la bandera de error (`rx_bad_block = 1`) y reemplazar los 8 bytes de salida en el bus `xgmii_rxd` con el carácter de error estándar `0xFE`.
 
-## 11. Orden recomendado de trabajo
-1. Cerrar Fase 0 (error injection + tamaños).
-2. Armar `tb_dut.sv` con el DUT y `SCRAMBLER_DISABLE=1`, `TX_GBX_IF_EN=0` → tests E1–E10.
-3. Activar scrambler → S1–S8 (modelo de referencia).
-4. Activar gearbox → G1–G6.
-5. End to end (Fase 5) y luego robustez.
+15. **Mapeo del Block Type para Start (0xFB) y Terminate (0xFD)**
+    * Enviar un paquete por XGMII. Asegurar que el byte de inicio (`0xFB`) caiga en el lane 0 y ajustar el tamaño del payload para forzar que el byte de fin (`0xFD`) caiga en un lane intermedio (ej. lane 3).
+    * Verifica que el codificador TX asigne los *Block Types* correctos definidos por la norma. Los primeros 8 bits del bloque codificado de Start deben ser `0x78`, y para el bloque de Terminate en el lane 3 deben ser `0xB4`.
+
+16. **Rechazo de Códigos de Control Desconocidos (Invalid Block Type)**
+    * Forzar mediante el testbench un bloque de control válido en el header (`serdes_rx_hdr = 10`), pero inyectar en `serdes_rx_data` un *Block Type* de 8 bits que no exista en la tabla de codificación de la cláusula 49 (por ejemplo, `0x15`).
+    * Al no reconocer el tipo de bloque, el módulo PCS no debe intentar interpretarlo y debe invalidar la palabra completa. Todo el bus `xgmii_rxc` debe ir a `0xFF` y `xgmii_rxd` llenarse de errores (`0xFE`).
+
+17. **Codificación de Ordered Sets (Local / Remote Faults)**
+    * Enviar a través del `xgmii_agent` el código de control `0x9C` (Sequence) en el lane 0, seguido de los bytes de notificación de falla (ej. `0x00 0x00 0x01` para Local Fault).
+    * Garantiza que el codificador identifique el *Ordered Set* de señalización de estado y lo empaquete utilizando el *Block Type* específico `0x4B` en `serdes_tx_data`. Es crítico para confirmar que la PHY puede propagar correctamente el estado del enlace físico.
